@@ -12,8 +12,8 @@ int motorRightSpeed = 0;
 
 int controlMode = 0;
 
-GMotor2<DRIVER2WIRE_PWM> motorLeft(MOTOR1_LEFT_2, MOTOR1_LEFT_1); 
-GMotor2<DRIVER2WIRE_PWM> motorRight(MOTOR2_RIGHT_2, MOTOR2_RIGHT_1); 
+GMotor2<DRIVER2WIRE_PWM> motorLeft(MOTOR1_LEFT_2, MOTOR1_LEFT_1);
+GMotor2<DRIVER2WIRE_PWM> motorRight(MOTOR2_RIGHT_2, MOTOR2_RIGHT_1);
 
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
 
@@ -92,7 +92,7 @@ void processGamepad(ControllerPtr ctl) {
       break;
     case 2:
     break;
-  }  
+  }
 }
 
 
@@ -105,10 +105,10 @@ void calcSpeedBothMotor(int direction,int baseSpeed){
   motorRightSpeed = baseSpeed;
 
   if (direction>0){
-    float popr = (abs(direction)/(float)511 * motorLeftSpeed)/float(3);     
+    float popr = (abs(direction)/(float)511 * motorLeftSpeed)/float(3);
     motorLeftSpeed -= (int)popr;
   }else{
-    float popr = (abs(direction)/(float)511 * motorRightSpeed)/float(3);      
+    float popr = (abs(direction)/(float)511 * motorRightSpeed)/float(3);
     motorRightSpeed -= (int)popr;
   }
 }
@@ -139,14 +139,14 @@ void processSelectControlMode(ControllerPtr ctl){
     for (int i=0;i<controlMode+1;i++){
       ctl->playDualRumble(0,150,400,400);
       delay(500);
-    }    
+    }
   }
 }
 
 
 void processControllers() {
     for (auto myController : myControllers) {
-        if (myController && myController->isConnected() && myController->hasData()) {          
+        if (myController && myController->isConnected() && myController->hasData()) {
             if (myController->isGamepad()) {
                 processGamepad(myController);
             } else {
@@ -173,12 +173,12 @@ void setup() {
     // But it might also fix some connection / re-connection issues.
     //BP32.forgetBluetoothKeys();
 
-    motorLeft.smoothMode(1); 
+    motorLeft.smoothMode(1);
     motorLeft.setMinDuty(60);
 
-    motorRight.smoothMode(1); 
+    motorRight.smoothMode(1);
     motorRight.setMinDuty(60);
-    
+
 }
 
 // Arduino loop function. Runs in CPU 1.
@@ -191,7 +191,7 @@ void loop() {
     bool dataUpdated = BP32.update();
     if (dataUpdated)
         processControllers();
-    
+
     motorLeft.setSpeed(motorLeftSpeed);
     motorRight.setSpeed(motorRightSpeed);
 
