@@ -1,11 +1,25 @@
 #include <Bluepad32.h>
 #include <GyverMotor2.h>
 
-#define MOTOR1_LEFT_1 26
-#define MOTOR1_LEFT_2 25
+#define MOTOR1_LEFT_1 32
+#define MOTOR1_LEFT_2 33
 
-#define MOTOR2_RIGHT_1 32
-#define MOTOR2_RIGHT_2 33
+#define MOTOR2_RIGHT_1 26
+#define MOTOR2_RIGHT_2 25
+
+#define SPEED_SENSOR_LEFT_PIN 35
+#define SPEED_SENSOR_RIGHT_PIN 34
+
+#define SLOTS_SPEED_DISK 20
+#define MEASURE_SPEED_INTERVAL 100
+
+volatile unsigned long pulseCountLeft = 0;
+volatile unsigned long pulseCountRight = 0;
+
+unsigned long speedLeft = 0;
+unsigned long speedRight = 0;
+
+double motorDiffCoefficient = 0;
 
 int motorLeftSpeed = 0;
 int motorRightSpeed = 0;
@@ -16,6 +30,15 @@ GMotor2<DRIVER2WIRE_PWM> motorLeft(MOTOR1_LEFT_2, MOTOR1_LEFT_1);
 GMotor2<DRIVER2WIRE_PWM> motorRight(MOTOR2_RIGHT_2, MOTOR2_RIGHT_1); 
 
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
+
+
+void IRAM_ATTR pulseISRLeft() {
+  pulseCountLeft++;
+}
+
+void IRAM_ATTR pulseISRRight() {
+  pulseCountRight++;
+}
 
 
 // This callback gets called any time a new gamepad is connected.
@@ -101,10 +124,15 @@ void calcSpeedBothMotor(int direction,int baseSpeed){
     baseSpeed = 0;
   }
 
-  motorLeftSpeed = baseSpeed;
-  motorRightSpeed = baseSpeed;
+  int calcMotorRightSpeed = motorRightSpeed+(int)(motorRightSpeed*motorDiffCoefficient);
 
-  if (direction>0){
+  motorLeftSpeed = baseSpeed;
+  // Без поправок
+  // motorRightSpeed = baseSpeed;
+  // Используя поправочный коэфициент разности моторов
+  motorRightSpeed = baseSpeed-(int)(baseSpeed*motorDiffCoefficient);
+
+  if (direction<0){
     float popr = (abs(direction)/(float)511 * motorLeftSpeed)/float(3);     
     motorLeftSpeed -= (int)popr;
   }else{
@@ -163,6 +191,13 @@ void setup() {
     const uint8_t* addr = BP32.localBdAddress();
     Serial.printf("BD Addr: %2X:%2X:%2X:%2X:%2X:%2X\n", addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
 
+    // Setup SpeedSensor
+    pinMode(SPEED_SENSOR_LEFT_PIN, INPUT);
+    pinMode(SPEED_SENSOR_RIGHT_PIN, INPUT);
+    attachInterrupt(digitalPinToInterrupt(SPEED_SENSOR_LEFT_PIN), pulseISRLeft, RISING);
+    attachInterrupt(digitalPinToInterrupt(SPEED_SENSOR_RIGHT_PIN), pulseISRRight, RISING);
+
+
     // Setup the Bluepad32 callbacks
     BP32.setup(&onConnectedController, &onDisconnectedController);
 
@@ -192,10 +227,34 @@ void loop() {
     if (dataUpdated)
         processControllers();
     
+    // Вычисляем скорость моторов
+    static unsigned long lastTime = 0;
+    unsigned long now = millis();
+    if (now - lastTime >= MEASURE_SPEED_INTERVAL) {
+      //Serial.printf("Импульсов слева: %d справа: %d\n",pulseCountLeft,pulseCountRight);  
+      speedLeft = pulseCountLeft;
+      speedRight = pulseCountRight;
+
+      if (motorLeftSpeed!=0){
+        double calcSpeedRight = (motorRightSpeed*pulseCountLeft)/motorLeftSpeed;
+        if (speedRight!=0){
+          motorDiffCoefficient = (calcSpeedRight-speedRight)/speedRight;
+        }else{
+          motorDiffCoefficient = 0;
+        }        
+      }else{
+        motorDiffCoefficient = 0;
+      }   
+
+      pulseCountLeft = 0;  // Сбрасываем счетчик
+      pulseCountRight = 0;  // Сбрасываем счетчик    
+      lastTime = now;
+    } 
+
+    Serial.printf("m1: %4d, imp1: %4d, m2:  %4d, imp2: %4d, koef: %4f\n",motorLeftSpeed,speedLeft,motorRightSpeed,speedRight,motorDiffCoefficient); 
+
     motorLeft.setSpeed(motorLeftSpeed);
     motorRight.setSpeed(motorRightSpeed);
-
-    Serial.printf("motor1: %4d, motor2:  %4d\n",motorLeftSpeed,motorRightSpeed);
 
     vTaskDelay(1);
 }
