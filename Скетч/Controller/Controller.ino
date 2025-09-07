@@ -2,25 +2,42 @@
 #include <Bluepad32.h>
 #include <GyverMotor2.h>
 
+/*
+***************
+Общие константы
+***************
+*/
 #define BAUDRATE 115200
+#define MEASURE_SPEED_INTERVAL 100
 
-// Определение количества «секторов» (равномерно делим 360° на 12 частей).
-#define NUM_SECTORS 12
+/*
+Режим управления
+*/
+int controlMode = 0;
 
-#define LIDAR_RX_PIN 16
-#define LIDAR_TX_PIN -1
-
+/*
+*******************
+Управление моторами
+*******************
+*/
 #define MOTOR1_LEFT_1 32
 #define MOTOR1_LEFT_2 33
 
 #define MOTOR2_RIGHT_1 26
 #define MOTOR2_RIGHT_2 25
 
+GMotor2<DRIVER2WIRE_PWM> motorLeft(MOTOR1_LEFT_2, MOTOR1_LEFT_1); 
+GMotor2<DRIVER2WIRE_PWM> motorRight(MOTOR2_RIGHT_2, MOTOR2_RIGHT_1); 
+
+/*
+****************
+Датчики скорости
+****************
+*/
 #define SPEED_SENSOR_LEFT_PIN 35
 #define SPEED_SENSOR_RIGHT_PIN 34
 
 #define SLOTS_SPEED_DISK 20
-#define MEASURE_SPEED_INTERVAL 100
 
 volatile unsigned long pulseCountLeft = 0;
 volatile unsigned long pulseCountRight = 0;
@@ -28,18 +45,27 @@ volatile unsigned long pulseCountRight = 0;
 unsigned long speedLeft = 0;
 unsigned long speedRight = 0;
 
-double motorDiffCoefficient = 0;
-
 int motorLeftSpeed = 0;
 int motorRightSpeed = 0;
 
-int controlMode = 0;
+double motorDiffCoefficient = 0;
 
-GMotor2<DRIVER2WIRE_PWM> motorLeft(MOTOR1_LEFT_2, MOTOR1_LEFT_1); 
-GMotor2<DRIVER2WIRE_PWM> motorRight(MOTOR2_RIGHT_2, MOTOR2_RIGHT_1); 
-
+/*
+**************
+Контроллер PS4
+**************
+*/
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
 
+/*
+************************************
+Считывание данных с лидара Dreame D9
+************************************
+*/
+// Определение количества «секторов» (равномерно делим 360° на 12 частей).
+#define NUM_SECTORS 12
+// Получение данных по UART
+#define LIDAR_RX_PIN 16
 // Структура пакета лидара: 4 байта заголовка, затем 32 байта данных
 static const uint8_t LIDAR_HEADER[] = { 0x55, 0xAA, 0x03, 0x08 };
 static const uint8_t LIDAR_HEADER_LEN = 4;
@@ -60,9 +86,8 @@ void IRAM_ATTR pulseISRRight() {
 #define ALARM_HOLD_MS 300  // Время (мс), которое сектор будет «залипать» в красном
 #define SECTOR_OFFSET 1    // Cдвиг секторов (0..11)
 
-/********************************************************
- *  ГЛОБАЛЬНЫЕ МАССИВЫ
- ********************************************************/
+
+// ГЛОБАЛЬНЫЕ МАССИВЫ
 // Храним текущее измеренное расстояние по каждому из 12 секторов.
 // При отсутствии данных в секторе значение будет NO_VALUE.
 static float sectorDistances[NUM_SECTORS] = { 0.0f };
@@ -75,6 +100,7 @@ static uint32_t sectorAlarmUntil[NUM_SECTORS] = { 0 };
 
 // Константа, обозначающая «нет данных».
 static const float NO_VALUE = 99999.0f;
+
 
 // This callback gets called any time a new gamepad is connected.
 // Up to 4 gamepads can be connected at the same time.
@@ -140,8 +166,12 @@ void onDisconnectedController(ControllerPtr ctl) {
 
 void processGamepad(ControllerPtr ctl) {
   processSelectControlMode(ctl);
+  // Вычисление значений для моторов    
+  processMotor(ctl);
+}
 
-  switch (controlMode){
+void processMotor(ControllerPtr ctl){
+   switch (controlMode){
     case 0:
       processRunControlMode0(ctl);
       break;
@@ -149,10 +179,11 @@ void processGamepad(ControllerPtr ctl) {
       processRunControlMode1(ctl);
       break;
     case 2:
+      processRunControlMode2(ctl);
+      break;
     break;
   }  
 }
-
 
 void calcSpeedBothMotor(int direction,int baseSpeed){
   if (abs(baseSpeed)<30){
@@ -189,6 +220,14 @@ void processRunControlMode1(ControllerPtr ctl){
   int direction = ctl->axisRX();
   calcSpeedBothMotor(direction,baseSpeed);
  // Serial.printf("x: %4d, motor1: %4d, motor2:  %4d\n",direction,motorLeftSpeed,motorRightSpeed);
+}
+
+void processRunControlMode2(ControllerPtr ctl){
+  int baseSpeed = map(ctl->throttle()-ctl->brake(),-1023,1023,-255,255);
+  int direction = ctl->axisX();  
+  motorLeftSpeed=baseSpeed;
+  motorRightSpeed=baseSpeed;
+  //Serial.printf("x: %4d, motor1: %4d, motor2:  %4d\n",direction,motorLeftSpeed,motorRightSpeed);
 }
 
 
@@ -494,53 +533,45 @@ bool parseAndProcessPacket() {
 
 // Arduino setup function. Runs in CPU 1
 void setup() {
-    Serial.begin(BAUDRATE);
-    // Инициализация Serial1 для чтения данных лидара (указать пины RX/TX)
-    Serial1.begin(BAUDRATE, SERIAL_8N1, LIDAR_RX_PIN, LIDAR_TX_PIN);
+    Serial.begin(BAUDRATE); 
 
     Serial.printf("Firmware: %s\n", BP32.firmwareVersion());
     const uint8_t* addr = BP32.localBdAddress();
     Serial.printf("BD Addr: %2X:%2X:%2X:%2X:%2X:%2X\n", addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
 
-    // Setup SpeedSensor
+    // Инициализация Serial1 для чтения данных лидара (указать пины RX/TX)
+    Serial1.begin(BAUDRATE, SERIAL_8N1, LIDAR_RX_PIN, -1);
+
+    // Инициализация датчиков скорости
     pinMode(SPEED_SENSOR_LEFT_PIN, INPUT);
     pinMode(SPEED_SENSOR_RIGHT_PIN, INPUT);
     attachInterrupt(digitalPinToInterrupt(SPEED_SENSOR_LEFT_PIN), pulseISRLeft, RISING);
     attachInterrupt(digitalPinToInterrupt(SPEED_SENSOR_RIGHT_PIN), pulseISRRight, RISING);
 
-
     // Setup the Bluepad32 callbacks
     BP32.setup(&onConnectedController, &onDisconnectedController);
 
-    // "forgetBluetoothKeys()" should be called when the user performs
-    // a "device factory reset", or similar.
-    // Calling "forgetBluetoothKeys" in setup() just as an example.
-    // Forgetting Bluetooth keys prevents "paired" gamepads to reconnect.
-    // But it might also fix some connection / re-connection issues.
+    // Расскоментировать если будут проблемы с подключением конроллера
     //BP32.forgetBluetoothKeys();
 
+    // Установка плавного изменения скорости для моторов
     motorLeft.smoothMode(1); 
-    motorLeft.setMinDuty(60);
+    motorRight.smoothMode(1);     
 
-    motorRight.smoothMode(1); 
+    // Установка минимального порога срабатывания моторов
+    motorLeft.setMinDuty(60);    
     motorRight.setMinDuty(60);
-    
 }
 
-// Arduino loop function. Runs in CPU 1.
 void loop() {
-     // В основном цикле просто пытаемся считать и обработать пакет
-    parseAndProcessPacket();
+    // Обработка сигналов контроллера    
+    if (BP32.update())
+        processControllers();
 
+    // 
     motorLeft.tick();
     motorRight.tick();
-
-    // This call fetches all the controllers' data.
-    // Call this function in your main loop.
-    bool dataUpdated = BP32.update();
-    if (dataUpdated)
-        processControllers();
-    
+     
     // Вычисляем скорость моторов
     static unsigned long lastTime = 0;
     unsigned long now = millis();
@@ -565,10 +596,10 @@ void loop() {
       lastTime = now;
     } 
 
-   // Serial.printf("m1: %4d, imp1: %4d, m2:  %4d, imp2: %4d, koef: %4f\n",motorLeftSpeed,speedLeft,motorRightSpeed,speedRight,motorDiffCoefficient); 
+    Serial.printf("m1: %4d, imp1: %4d, m2:  %4d, imp2: %4d, koef: %4f\n",motorLeftSpeed,speedLeft,motorRightSpeed,speedRight,motorDiffCoefficient); 
 
     motorLeft.setSpeed(motorLeftSpeed);
     motorRight.setSpeed(motorRightSpeed);
 
-    //vTaskDelay(1);
+    vTaskDelay(1);
 }
