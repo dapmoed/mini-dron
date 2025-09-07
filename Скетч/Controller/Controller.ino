@@ -48,6 +48,7 @@ unsigned long speedRight = 0;
 int motorLeftSpeed = 0;
 int motorRightSpeed = 0;
 
+
 double motorDiffCoefficient = 0;
 
 /*
@@ -66,6 +67,7 @@ ControllerPtr myControllers[BP32_MAX_GAMEPADS];
 #define NUM_SECTORS 12
 // Получение данных по UART
 #define LIDAR_RX_PIN 16
+
 // Структура пакета лидара: 4 байта заголовка, затем 32 байта данных
 static const uint8_t LIDAR_HEADER[] = { 0x55, 0xAA, 0x03, 0x08 };
 static const uint8_t LIDAR_HEADER_LEN = 4;
@@ -85,6 +87,7 @@ void IRAM_ATTR pulseISRRight() {
 #define WARNING_DIST 650   // Менее 650 мм (но >= 400 мм) -> жёлтый
 #define ALARM_HOLD_MS 300  // Время (мс), которое сектор будет «залипать» в красном
 #define SECTOR_OFFSET 1    // Cдвиг секторов (0..11)
+
 
 
 // ГЛОБАЛЬНЫЕ МАССИВЫ
@@ -541,8 +544,6 @@ void setup() {
 
     // Инициализация Serial1 для чтения данных лидара (указать пины RX/TX)
     Serial1.begin(BAUDRATE, SERIAL_8N1, LIDAR_RX_PIN, -1);
-
-    // Инициализация датчиков скорости
     pinMode(SPEED_SENSOR_LEFT_PIN, INPUT);
     pinMode(SPEED_SENSOR_RIGHT_PIN, INPUT);
     attachInterrupt(digitalPinToInterrupt(SPEED_SENSOR_LEFT_PIN), pulseISRLeft, RISING);
@@ -571,7 +572,7 @@ void loop() {
     // 
     motorLeft.tick();
     motorRight.tick();
-     
+  
     // Вычисляем скорость моторов
     static unsigned long lastTime = 0;
     unsigned long now = millis();
@@ -596,10 +597,12 @@ void loop() {
       lastTime = now;
     } 
 
+
     Serial.printf("m1: %4d, imp1: %4d, m2:  %4d, imp2: %4d, koef: %4f\n",motorLeftSpeed,speedLeft,motorRightSpeed,speedRight,motorDiffCoefficient); 
 
     motorLeft.setSpeed(motorLeftSpeed);
     motorRight.setSpeed(motorRightSpeed);
+
 
     vTaskDelay(1);
 }
