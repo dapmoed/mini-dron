@@ -17,7 +17,7 @@ int controlMode = 0;
 
 /*
 *******************
-Управление моторами
+Управление моторами.
 *******************
 */
 #define MOTOR1_LEFT_1 32
@@ -28,6 +28,17 @@ int controlMode = 0;
 
 GMotor2<DRIVER2WIRE_PWM> motorLeft(MOTOR1_LEFT_2, MOTOR1_LEFT_1); 
 GMotor2<DRIVER2WIRE_PWM> motorRight(MOTOR2_RIGHT_2, MOTOR2_RIGHT_1); 
+
+int motorLeftSpeed = 0;
+int motorRightSpeed = 0;
+
+// ПИД-регуляторы для управления скоростью моторов
+float pidLeftKp = 0.5, pidLeftKi = 0.1, pidLeftKd = 0.05;
+float pidRightKp = 0.5, pidRightKi = 0.1, pidRightKd = 0.05;
+
+float pidLeftIntegral = 0, pidLeftPrevError = 0;
+float pidRightIntegral = 0, pidRightPrevError = 0;
+
 
 /*
 ****************
@@ -45,11 +56,6 @@ volatile unsigned long pulseCountRight = 0;
 unsigned long speedLeft = 0;
 unsigned long speedRight = 0;
 
-int motorLeftSpeed = 0;
-int motorRightSpeed = 0;
-
-
-double motorDiffCoefficient = 0;
 
 /*
 **************
@@ -86,7 +92,7 @@ void IRAM_ATTR pulseISRRight() {
 #define ALARM_DIST 400     // Менее 400 мм -> сектор в красном цвете
 #define WARNING_DIST 650   // Менее 650 мм (но >= 400 мм) -> жёлтый
 #define ALARM_HOLD_MS 300  // Время (мс), которое сектор будет «залипать» в красном
-#define SECTOR_OFFSET 1    // Cдвиг секторов (0..11)
+#define SECTOR_OFFSET 0    // Cдвиг секторов (0..11)
 
 
 
@@ -188,26 +194,104 @@ void processMotor(ControllerPtr ctl){
   }  
 }
 
+/**
+ * @brief Функция ПИД-регулятора для управления скоростью мотора
+ * @param targetSpeed Целевая скорость (от -255 до 255)
+ * @param currentSpeed Текущая измеренная скорость (импульсы/интервал)
+ * @param kp Коэффициент пропорциональной составляющей
+ * @param ki Коэффициент интегральной составляющей
+ * @param kd Коэффициент дифференциальной составляющей
+ * @param integral Ссылка на интегральную сумму
+ * @param prevError Ссылка на предыдущую ошибку
+ * @return Управляющее воздействие (от -255 до 255)
+ */
+int pidController(int targetSpeed, int currentSpeed, float kp, float ki, float kd, float &integral, float &prevError) {
+  // Если целевая скорость 0, просто возвращаем 0
+  if (targetSpeed == 0) {
+    integral = 0;
+    prevError = 0;
+    return 0;
+  }
+
+  // Нормализуем текущую скорость к диапазону -255..255
+  // Предполагаем, что максимальная скорость соответствует 255
+  int normalizedCurrent = map(constrain(currentSpeed, 0, 100), 0, 100, 0, 255);
+  if (targetSpeed < 0) {
+    normalizedCurrent = -normalizedCurrent;
+  }
+
+  // Вычисляем ошибку
+  float error = targetSpeed - normalizedCurrent;
+
+  // Пропорциональная составляющая
+  float p = kp * error;
+
+  // Интегральная составляющая (с насыщением)
+  integral += error;
+  integral = constrain(integral, -100, 100);
+  float i = ki * integral;
+
+  // Дифференциальная составляющая
+  float d = kd * (error - prevError);
+  prevError = error;
+
+  // Суммируем составляющие
+  float output = p + i + d;
+
+  // Ограничиваем выходное значение
+  output = constrain(output, -255, 255);
+
+  return (int)output;
+}
+
+/**
+ * @brief Функция управления скоростью мотора с обратной связью
+ * @param targetSpeed Целевая скорость от контроллера (-255..255)
+ * @param currentSpeed Текущая измеренная скорость мотора
+ * @param isLeftMotor Флаг, указывающий на левый мотор (true) или правый (false)
+ * @return Управляющее воздействие для мотора
+ */
+int controlMotorSpeed(int targetSpeed, int currentSpeed, bool isLeftMotor) {
+  // Если целевая скорость очень мала, отключаем мотор
+  if (abs(targetSpeed) < 30) {
+    if (isLeftMotor) {
+      pidLeftIntegral = 0;
+      pidLeftPrevError = 0;
+    } else {
+      pidRightIntegral = 0;
+      pidRightPrevError = 0;
+    }
+    return 0;
+  }
+
+  // Применяем ПИД-регулятор
+  if (isLeftMotor) {
+    return pidController(targetSpeed, currentSpeed, pidLeftKp, pidLeftKi, pidLeftKd, pidLeftIntegral, pidLeftPrevError);
+  } else {
+    return pidController(targetSpeed, currentSpeed, pidRightKp, pidRightKi, pidRightKd, pidRightIntegral, pidRightPrevError);
+  }
+}
+
 void calcSpeedBothMotor(int direction,int baseSpeed){
   if (abs(baseSpeed)<30){
     baseSpeed = 0;
   }
 
-  int calcMotorRightSpeed = motorRightSpeed+(int)(motorRightSpeed*motorDiffCoefficient);
-
-  motorLeftSpeed = baseSpeed;
-  // Без поправок
-  // motorRightSpeed = baseSpeed;
-  // Используя поправочный коэфициент разности моторов
-  motorRightSpeed = baseSpeed-(int)(baseSpeed*motorDiffCoefficient);
+  // Базовые скорости без обратной связи
+  int baseLeftSpeed = baseSpeed;
+  int baseRightSpeed = baseSpeed;
 
   if (direction<0){
-    float popr = (abs(direction)/(float)511 * motorLeftSpeed)/float(3);     
-    motorLeftSpeed -= (int)popr;
+    float popr = (abs(direction)/(float)511 * baseLeftSpeed)/float(3);     
+    baseLeftSpeed -= (int)popr;
   }else{
-    float popr = (abs(direction)/(float)511 * motorRightSpeed)/float(3);      
-    motorRightSpeed -= (int)popr;
+    float popr = (abs(direction)/(float)511 * baseRightSpeed)/float(3);      
+    baseRightSpeed -= (int)popr;
   }
+
+  // Применяем управление с обратной связью
+  motorLeftSpeed = controlMotorSpeed(baseLeftSpeed, pulseCountLeft, true);
+  motorRightSpeed = controlMotorSpeed(baseRightSpeed, pulseCountRight, false);
 }
 
 void processRunControlMode0(ControllerPtr ctl){
@@ -276,8 +360,7 @@ bool waitForHeader(HardwareSerial &ser) {
   // Пытаемся «выровнять» поток байт на заголовок (4 байта)
   while (true) {
     if (ser.available()) {
-      uint8_t b = ser.read();
-      Serial.println(b);
+      uint8_t b = ser.read();      
       if (b == LIDAR_HEADER[matchPos]) {
         // Совпало очередное ожидаемое значение заголовка
         matchPos++;
@@ -505,7 +588,7 @@ bool parseAndProcessPacket() {
   // Serial.println();
   // 13) Передаем статусы секторов по UART в виде строки
   //     "SECTORS: 0 1 2 ..." (0=зелёный, 1=жёлтый, 2=красный)
-  Serial.print("SECTORS: ");
+  //Serial.print("SECTORS: ");
   for (int s = 0; s < NUM_SECTORS; s++) {
     int sectorStatus;
     float dist = sectorDistances[s];
@@ -524,7 +607,8 @@ bool parseAndProcessPacket() {
       sectorStatus = 0;
     }
 
-    Serial.print(sectorStatus);
+     Serial.print(sectorStatus);
+    //Serial.print(dist);
     if (s < (NUM_SECTORS - 1)) {
       Serial.print(" ");
     }
@@ -544,6 +628,8 @@ void setup() {
 
     // Инициализация Serial1 для чтения данных лидара (указать пины RX/TX)
     Serial1.begin(BAUDRATE, SERIAL_8N1, LIDAR_RX_PIN, -1);
+
+    // Инициализация датчиков скорости
     pinMode(SPEED_SENSOR_LEFT_PIN, INPUT);
     pinMode(SPEED_SENSOR_RIGHT_PIN, INPUT);
     attachInterrupt(digitalPinToInterrupt(SPEED_SENSOR_LEFT_PIN), pulseISRLeft, RISING);
@@ -573,24 +659,15 @@ void loop() {
     motorLeft.tick();
     motorRight.tick();
   
+    // 
+    parseAndProcessPacket();
+
     // Вычисляем скорость моторов
     static unsigned long lastTime = 0;
     unsigned long now = millis();
-    if (now - lastTime >= MEASURE_SPEED_INTERVAL) {
-      //Serial.printf("Импульсов слева: %d справа: %d\n",pulseCountLeft,pulseCountRight);  
+    if (now - lastTime >= MEASURE_SPEED_INTERVAL) {      
       speedLeft = pulseCountLeft;
-      speedRight = pulseCountRight;
-
-      if (motorLeftSpeed!=0){
-        double calcSpeedRight = (motorRightSpeed*pulseCountLeft)/motorLeftSpeed;
-        if (speedRight!=0){
-          motorDiffCoefficient = (calcSpeedRight-speedRight)/speedRight;
-        }else{
-          motorDiffCoefficient = 0;
-        }        
-      }else{
-        motorDiffCoefficient = 0;
-      }   
+      speedRight = pulseCountRight;   
 
       pulseCountLeft = 0;  // Сбрасываем счетчик
       pulseCountRight = 0;  // Сбрасываем счетчик    
@@ -598,7 +675,10 @@ void loop() {
     } 
 
 
-    Serial.printf("m1: %4d, imp1: %4d, m2:  %4d, imp2: %4d, koef: %4f\n",motorLeftSpeed,speedLeft,motorRightSpeed,speedRight,motorDiffCoefficient); 
+    //Serial.printf("m1: %4d, imp1: %4d, m2:  %4d, imp2: %4d\n",motorLeftSpeed,speedLeft,motorRightSpeed,speedRight); 
+    //Serial.printf("%4d %4d %4d %4d\n",motorLeftSpeed,speedLeft,motorRightSpeed,speedRight); 
+
+    //Serial.printf("%4d %4d\n",motorLeftSpeed,speedLeft); 
 
     motorLeft.setSpeed(motorLeftSpeed);
     motorRight.setSpeed(motorRightSpeed);
