@@ -1,6 +1,10 @@
 #include <Arduino.h>
 #include <Bluepad32.h>
 #include <GyverMotor2.h>
+#include <GTimer.h>
+#include <uPID.h>
+
+
 
 /*
 ***************
@@ -26,18 +30,14 @@ int controlMode = 0;
 #define MOTOR2_RIGHT_1 26
 #define MOTOR2_RIGHT_2 25
 
-GMotor2<DRIVER2WIRE_PWM> motorLeft(MOTOR1_LEFT_2, MOTOR1_LEFT_1); 
-GMotor2<DRIVER2WIRE_PWM> motorRight(MOTOR2_RIGHT_2, MOTOR2_RIGHT_1); 
+GMotor2<DRIVER2WIRE_PWM> motorLeft(MOTOR1_LEFT_2, MOTOR1_LEFT_1);
+GMotor2<DRIVER2WIRE_PWM> motorRight(MOTOR2_RIGHT_2, MOTOR2_RIGHT_1);
 
 int motorLeftSpeed = 0;
 int motorRightSpeed = 0;
 
-// ПИД-регуляторы для управления скоростью моторов
-float pidLeftKp = 0.5, pidLeftKi = 0.1, pidLeftKd = 0.05;
-float pidRightKp = 0.5, pidRightKi = 0.1, pidRightKd = 0.05;
-
-float pidLeftIntegral = 0, pidLeftPrevError = 0;
-float pidRightIntegral = 0, pidRightPrevError = 0;
+const int dt = 30;
+uPID pid(P_INPUT |D_INPUT| I_SATURATE);
 
 
 /*
@@ -50,13 +50,14 @@ float pidRightIntegral = 0, pidRightPrevError = 0;
 
 #define SLOTS_SPEED_DISK 20
 
-volatile unsigned long pulseCountLeft = 0;
-volatile unsigned long pulseCountRight = 0;
+long pulseCountLeft = 0;
+long pulseCountRight = 0;
 
-unsigned long speedLeft = 0;
-unsigned long speedRight = 0;
+long speedLeft = 0;
+long speedRight = 0;
 
-
+// Положение дроселя
+int throttle = 0;
 /*
 **************
 Контроллер PS4
@@ -114,40 +115,40 @@ static const float NO_VALUE = 99999.0f;
 // This callback gets called any time a new gamepad is connected.
 // Up to 4 gamepads can be connected at the same time.
 void onConnectedController(ControllerPtr ctl) {
-    bool foundEmptySlot = false;
-    for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
-        if (myControllers[i] == nullptr) {
-            Serial.printf("CALLBACK: Controller is connected, index=%d\n", i);
-            // Additionally, you can get certain gamepad properties like:
-            // Model, VID, PID, BTAddr, flags, etc.
-            ControllerProperties properties = ctl->getProperties();
-            Serial.printf("Controller model: %s, VID=0x%04x, PID=0x%04x\n", ctl->getModelName().c_str(), properties.vendor_id,
-                           properties.product_id);
-            myControllers[i] = ctl;
-            foundEmptySlot = true;
-            break;
-        }
+  bool foundEmptySlot = false;
+  for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
+    if (myControllers[i] == nullptr) {
+      Serial.printf("CALLBACK: Controller is connected, index=%d\n", i);
+      // Additionally, you can get certain gamepad properties like:
+      // Model, VID, PID, BTAddr, flags, etc.
+      ControllerProperties properties = ctl->getProperties();
+      Serial.printf("Controller model: %s, VID=0x%04x, PID=0x%04x\n", ctl->getModelName().c_str(), properties.vendor_id,
+                    properties.product_id);
+      myControllers[i] = ctl;
+      foundEmptySlot = true;
+      break;
     }
-    if (!foundEmptySlot) {
-        Serial.println("CALLBACK: Controller connected, but could not found empty slot");
-    }
+  }
+  if (!foundEmptySlot) {
+    Serial.println("CALLBACK: Controller connected, but could not found empty slot");
+  }
 }
 
 void onDisconnectedController(ControllerPtr ctl) {
-    bool foundController = false;
+  bool foundController = false;
 
-    for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
-        if (myControllers[i] == ctl) {
-            Serial.printf("CALLBACK: Controller disconnected from index=%d\n", i);
-            myControllers[i] = nullptr;
-            foundController = true;
-            break;
-        }
+  for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
+    if (myControllers[i] == ctl) {
+      Serial.printf("CALLBACK: Controller disconnected from index=%d\n", i);
+      myControllers[i] = nullptr;
+      foundController = true;
+      break;
     }
+  }
 
-    if (!foundController) {
-        Serial.println("CALLBACK: Controller disconnected, but not found in myControllers");
-    }
+  if (!foundController) {
+    Serial.println("CALLBACK: Controller disconnected, but not found in myControllers");
+  }
 }
 
 // void dumpGamepad(ControllerPtr ctl) {
@@ -175,12 +176,12 @@ void onDisconnectedController(ControllerPtr ctl) {
 
 void processGamepad(ControllerPtr ctl) {
   processSelectControlMode(ctl);
-  // Вычисление значений для моторов    
+  // Вычисление значений для моторов
   processMotor(ctl);
 }
 
-void processMotor(ControllerPtr ctl){
-   switch (controlMode){
+void processMotor(ControllerPtr ctl) {
+  switch (controlMode) {
     case 0:
       processRunControlMode0(ctl);
       break;
@@ -190,90 +191,12 @@ void processMotor(ControllerPtr ctl){
     case 2:
       processRunControlMode2(ctl);
       break;
-    break;
-  }  
-}
-
-/**
- * @brief Функция ПИД-регулятора для управления скоростью мотора
- * @param targetSpeed Целевая скорость (от -255 до 255)
- * @param currentSpeed Текущая измеренная скорость (импульсы/интервал)
- * @param kp Коэффициент пропорциональной составляющей
- * @param ki Коэффициент интегральной составляющей
- * @param kd Коэффициент дифференциальной составляющей
- * @param integral Ссылка на интегральную сумму
- * @param prevError Ссылка на предыдущую ошибку
- * @return Управляющее воздействие (от -255 до 255)
- */
-int pidController(int targetSpeed, int currentSpeed, float kp, float ki, float kd, float &integral, float &prevError) {
-  // Если целевая скорость 0, просто возвращаем 0
-  if (targetSpeed == 0) {
-    integral = 0;
-    prevError = 0;
-    return 0;
-  }
-
-  // Нормализуем текущую скорость к диапазону -255..255
-  // Предполагаем, что максимальная скорость соответствует 255
-  int normalizedCurrent = map(constrain(currentSpeed, 0, 100), 0, 100, 0, 255);
-  if (targetSpeed < 0) {
-    normalizedCurrent = -normalizedCurrent;
-  }
-
-  // Вычисляем ошибку
-  float error = targetSpeed - normalizedCurrent;
-
-  // Пропорциональная составляющая
-  float p = kp * error;
-
-  // Интегральная составляющая (с насыщением)
-  integral += error;
-  integral = constrain(integral, -100, 100);
-  float i = ki * integral;
-
-  // Дифференциальная составляющая
-  float d = kd * (error - prevError);
-  prevError = error;
-
-  // Суммируем составляющие
-  float output = p + i + d;
-
-  // Ограничиваем выходное значение
-  output = constrain(output, -255, 255);
-
-  return (int)output;
-}
-
-/**
- * @brief Функция управления скоростью мотора с обратной связью
- * @param targetSpeed Целевая скорость от контроллера (-255..255)
- * @param currentSpeed Текущая измеренная скорость мотора
- * @param isLeftMotor Флаг, указывающий на левый мотор (true) или правый (false)
- * @return Управляющее воздействие для мотора
- */
-int controlMotorSpeed(int targetSpeed, int currentSpeed, bool isLeftMotor) {
-  // Если целевая скорость очень мала, отключаем мотор
-  if (abs(targetSpeed) < 30) {
-    if (isLeftMotor) {
-      pidLeftIntegral = 0;
-      pidLeftPrevError = 0;
-    } else {
-      pidRightIntegral = 0;
-      pidRightPrevError = 0;
-    }
-    return 0;
-  }
-
-  // Применяем ПИД-регулятор
-  if (isLeftMotor) {
-    return pidController(targetSpeed, currentSpeed, pidLeftKp, pidLeftKi, pidLeftKd, pidLeftIntegral, pidLeftPrevError);
-  } else {
-    return pidController(targetSpeed, currentSpeed, pidRightKp, pidRightKi, pidRightKd, pidRightIntegral, pidRightPrevError);
+      break;
   }
 }
 
-void calcSpeedBothMotor(int direction,int baseSpeed){
-  if (abs(baseSpeed)<30){
+void calcSpeedBothMotor(int direction, int baseSpeed) {
+  if (abs(baseSpeed) < 30) {
     baseSpeed = 0;
   }
 
@@ -281,68 +204,68 @@ void calcSpeedBothMotor(int direction,int baseSpeed){
   int baseLeftSpeed = baseSpeed;
   int baseRightSpeed = baseSpeed;
 
-  if (direction<0){
-    float popr = (abs(direction)/(float)511 * baseLeftSpeed)/float(3);     
+  if (direction < 0) {
+    float popr = (abs(direction) / (float)511 * baseLeftSpeed) / float(3);
     baseLeftSpeed -= (int)popr;
-  }else{
-    float popr = (abs(direction)/(float)511 * baseRightSpeed)/float(3);      
+  } else {
+    float popr = (abs(direction) / (float)511 * baseRightSpeed) / float(3);
     baseRightSpeed -= (int)popr;
   }
 
-  // Применяем управление с обратной связью
-  motorLeftSpeed = controlMotorSpeed(baseLeftSpeed, pulseCountLeft, true);
-  motorRightSpeed = controlMotorSpeed(baseRightSpeed, pulseCountRight, false);
+  //motorLeftSpeed = baseLeftSpeed;
+  motorRightSpeed = baseRightSpeed;
 }
 
-void processRunControlMode0(ControllerPtr ctl){
-  int baseSpeed = map(ctl->throttle()-ctl->brake(),-1023,1023,-255,255);
+void processRunControlMode0(ControllerPtr ctl) {
+  int baseSpeed = map(ctl->throttle() - ctl->brake(), -1023, 1023, -255, 255);
+  throttle = baseSpeed;
   int direction = ctl->axisX();
-  calcSpeedBothMotor(direction,baseSpeed);
+  calcSpeedBothMotor(direction, baseSpeed);
   //Serial.printf("x: %4d, motor1: %4d, motor2:  %4d\n",direction,motorLeftSpeed,motorRightSpeed);
 }
 
 
-void processRunControlMode1(ControllerPtr ctl){
-  int baseSpeed = map(ctl->axisRY(),512,-511,-255,255);
+void processRunControlMode1(ControllerPtr ctl) {
+  int baseSpeed = map(ctl->axisRY(), 512, -511, -255, 255);
   int direction = ctl->axisRX();
-  calcSpeedBothMotor(direction,baseSpeed);
- // Serial.printf("x: %4d, motor1: %4d, motor2:  %4d\n",direction,motorLeftSpeed,motorRightSpeed);
+  calcSpeedBothMotor(direction, baseSpeed);
+  // Serial.printf("x: %4d, motor1: %4d, motor2:  %4d\n",direction,motorLeftSpeed,motorRightSpeed);
 }
 
-void processRunControlMode2(ControllerPtr ctl){
-  int baseSpeed = map(ctl->throttle()-ctl->brake(),-1023,1023,-255,255);
-  int direction = ctl->axisX();  
-  motorLeftSpeed=baseSpeed;
-  motorRightSpeed=baseSpeed;
+void processRunControlMode2(ControllerPtr ctl) {
+  int baseSpeed = map(ctl->throttle() - ctl->brake(), -1023, 1023, -255, 255);
+  int direction = ctl->axisX();
+  motorLeftSpeed = baseSpeed;
+  motorRightSpeed = baseSpeed;
   //Serial.printf("x: %4d, motor1: %4d, motor2:  %4d\n",direction,motorLeftSpeed,motorRightSpeed);
 }
 
 
-void processSelectControlMode(ControllerPtr ctl){
-  if (ctl->miscSelect()){
+void processSelectControlMode(ControllerPtr ctl) {
+  if (ctl->miscSelect()) {
     controlMode++;
-    if (controlMode>2){
+    if (controlMode > 2) {
       controlMode = 0;
     }
-    Serial.printf("Change control mode: %4d",controlMode);
-    for (int i=0;i<controlMode+1;i++){
-      ctl->playDualRumble(0,150,400,400);
+    Serial.printf("Change control mode: %4d", controlMode);
+    for (int i = 0; i < controlMode + 1; i++) {
+      ctl->playDualRumble(0, 150, 400, 400);
       delay(500);
-    }    
+    }
   }
 }
 
 
 void processControllers() {
-    for (auto myController : myControllers) {
-        if (myController && myController->isConnected() && myController->hasData()) {          
-            if (myController->isGamepad()) {
-                processGamepad(myController);
-            } else {
-                Serial.println("Unsupported controller");
-            }
-        }
+  for (auto myController : myControllers) {
+    if (myController && myController->isConnected() && myController->hasData()) {
+      if (myController->isGamepad()) {
+        processGamepad(myController);
+      } else {
+        Serial.println("Unsupported controller");
+      }
     }
+  }
 }
 
 
@@ -353,14 +276,14 @@ void processControllers() {
  * @param ser Ссылка на Serial (обычно Serial1)
  * @return true, если заголовок найден, иначе false (по таймауту)
  */
-bool waitForHeader(HardwareSerial &ser) {
+bool waitForHeader(HardwareSerial& ser) {
   uint8_t matchPos = 0;
   uint32_t start = millis();
 
   // Пытаемся «выровнять» поток байт на заголовок (4 байта)
   while (true) {
     if (ser.available()) {
-      uint8_t b = ser.read();      
+      uint8_t b = ser.read();
       if (b == LIDAR_HEADER[matchPos]) {
         // Совпало очередное ожидаемое значение заголовка
         matchPos++;
@@ -406,7 +329,7 @@ float decodeAngle(uint16_t rawAngle) {
  * @param timeout_ms Максимальное время ожидания в миллисекундах (по умолчанию 500 мс)
  * @return true, если все байты успешно прочитаны, иначе false
  */
-bool readBytesWithTimeout(HardwareSerial &ser, uint8_t *buffer, size_t length, uint32_t timeout_ms = 500) {
+bool readBytesWithTimeout(HardwareSerial& ser, uint8_t* buffer, size_t length, uint32_t timeout_ms = 500) {
   uint32_t start = millis();
   size_t count = 0;
 
@@ -607,7 +530,7 @@ bool parseAndProcessPacket() {
       sectorStatus = 0;
     }
 
-     Serial.print(sectorStatus);
+    Serial.print(sectorStatus);
     //Serial.print(dist);
     if (s < (NUM_SECTORS - 1)) {
       Serial.print(" ");
@@ -618,71 +541,184 @@ bool parseAndProcessPacket() {
   return true;  // Пакет успешно обработан
 }
 
-// Arduino setup function. Runs in CPU 1
+// Функция для фиксирования значения скорости датчика за определенный промежуток времени и сброса счетчика
+void readSpeedSensor(long& speed, long& pullseCount) {
+  speed = map(constrain(pullseCount, 0, 15), 0, 15, 0, 255);
+  pullseCount = 0;  // Сбрасываем счетчик
+}
+
+
+// Класс для фильтрации значений с датчиков по скользящему среднему
+template<typename T, uint8_t N>
+class AverageWindow {
+public:
+  float filter(T val) {
+    _sum += val;
+    if (++_i >= N) _i = 0;
+    _sum -= _buffer[_i];
+    _buffer[_i] = val;
+    return (float)_sum / N;
+  }
+
+private:
+  T _buffer[N] = {};
+  T _sum = 0;
+  uint8_t _i = 0;
+};
+
+
+AverageWindow<int, 5> speedLeftAver;
+
+class SSF {
+public:
+  void init(float val) {
+    _y1 = _y2 = val;
+  }
+
+  // f_cut - частота среза
+  // f_discr - частота дискретизации
+  void config(float f_cut, float f_discr) {
+    float x = exp(-2.0 * 3.1415 * f_cut / f_discr);
+    _b0 = 1.0 - 2.0 * x + x * x;
+    _a1 = 2 * x;
+    _a2 = -x * x;
+  }
+
+  float filter(float val) {
+    float y = _b0 * val + _a1 * _y1 + _a2 * _y2;
+    _y2 = _y1;
+    _y1 = y;
+    return y;
+  }
+
+private:
+  float _b0 = 0, _a1 = 0, _a2 = 0;
+  float _y1 = 0, _y2 = 0;
+};
+
+SSF speedLeftSSF;
+
+template <typename T>
+class Median3 {
+   public:
+    T filter(T val) {
+        if (++_i >= 3) _i = 0;
+        _buf[_i] = val;
+        return getMedian(_buf[0], _buf[1], _buf[2]);
+    }
+
+    void init(T val) {
+        _buf[0] = _buf[1] = _buf[2] = val;
+    }
+
+    static inline T getMedian(T a, T b, T c) {
+        return (a < b) ? ((b < c) ? b : ((c < a) ? a : c)) : ((a < c) ? a : ((c < b) ? b : c));
+    }
+
+   private:
+    T _buf[3] = {};
+    uint8_t _i = 0;
+};
+
+Median3<int> medLeftSpeed;
+
+
 void setup() {
-    Serial.begin(BAUDRATE); 
+  Serial.begin(BAUDRATE);
 
-    Serial.printf("Firmware: %s\n", BP32.firmwareVersion());
-    const uint8_t* addr = BP32.localBdAddress();
-    Serial.printf("BD Addr: %2X:%2X:%2X:%2X:%2X:%2X\n", addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
+  Serial.printf("Firmware: %s\n", BP32.firmwareVersion());
+  const uint8_t* addr = BP32.localBdAddress();
+  Serial.printf("BD Addr: %2X:%2X:%2X:%2X:%2X:%2X\n", addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
 
-    // Инициализация Serial1 для чтения данных лидара (указать пины RX/TX)
-    Serial1.begin(BAUDRATE, SERIAL_8N1, LIDAR_RX_PIN, -1);
+  // Инициализация Serial1 для чтения данных лидара (указать пины RX/TX)
+  Serial1.begin(BAUDRATE, SERIAL_8N1, LIDAR_RX_PIN, -1);
 
-    // Инициализация датчиков скорости
-    pinMode(SPEED_SENSOR_LEFT_PIN, INPUT);
-    pinMode(SPEED_SENSOR_RIGHT_PIN, INPUT);
-    attachInterrupt(digitalPinToInterrupt(SPEED_SENSOR_LEFT_PIN), pulseISRLeft, RISING);
-    attachInterrupt(digitalPinToInterrupt(SPEED_SENSOR_RIGHT_PIN), pulseISRRight, RISING);
+  // Инициализация датчиков скорости
+  pinMode(SPEED_SENSOR_LEFT_PIN, INPUT);
+  pinMode(SPEED_SENSOR_RIGHT_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(SPEED_SENSOR_LEFT_PIN), pulseISRLeft, RISING);
+  attachInterrupt(digitalPinToInterrupt(SPEED_SENSOR_RIGHT_PIN), pulseISRRight, RISING);
 
-    // Setup the Bluepad32 callbacks
-    BP32.setup(&onConnectedController, &onDisconnectedController);
+  // PID управление моторами
+  // Не плохо работающий вариант - 1-0,3-0,1
+  pid.setKp(0.85);
+  pid.setKi(0.05);
+  pid.setKd(0.05);
 
-    // Расскоментировать если будут проблемы с подключением конроллера
-    //BP32.forgetBluetoothKeys();
+  // pid.Kbc = 0.1;
+  pid.setDt(dt);
+  pid.outMax = 255;
+  pid.outMin = 0;
 
-    // Установка плавного изменения скорости для моторов
-    motorLeft.smoothMode(1); 
-    motorRight.smoothMode(1);     
+  pid.setpoint = 0;
 
-    // Установка минимального порога срабатывания моторов
-    motorLeft.setMinDuty(60);    
-    motorRight.setMinDuty(60);
+  // Setup the Bluepad32 callbacks
+  BP32.setup(&onConnectedController, &onDisconnectedController);
+
+  // Расскоментировать если будут проблемы с подключением конроллера
+  //BP32.forgetBluetoothKeys();
+
+  // Установка плавного изменения скорости для моторов
+  //motorLeft.smoothMode(1);
+  //motorRight.smoothMode(1);
+
+  // Установка минимального порога срабатывания моторов
+  motorLeft.setMinDuty(77);
+  motorRight.setMinDuty(77);
+
+  // Инициализация фильтров
+  speedLeftSSF.config(5, 1 / 0.09);
+  speedLeftSSF.init(0);
+
+
+  medLeftSpeed.init(0);
 }
 
 void loop() {
-    // Обработка сигналов контроллера    
-    if (BP32.update())
-        processControllers();
+  // Обработка сигналов контроллера
+  if (BP32.update())
+    processControllers();
 
-    // 
-    motorLeft.tick();
-    motorRight.tick();
+  // Необходимо для плавного режима изменения скорости моторов
+  // motorLeft.tick();
+  // motorRight.tick();
+
+  // Обработка пакетов от лидара
+  // parseAndProcessPacket();
+
+  // Вычисляем скорость моторов
+  EVERY_MS(MEASURE_SPEED_INTERVAL) {
+    readSpeedSensor(speedLeft, pulseCountLeft);
+    speedLeft = medLeftSpeed.filter(speedLeft);
+    readSpeedSensor(speedRight, pulseCountRight);
+  }
+
+  //throttle = 200;
+
+  if (throttle!=0){    
+    pid.setpoint = throttle;  
+    motorLeftSpeed = (int)pid.compute(speedLeft);    
+  }else{
+    motorLeftSpeed = 0;
+  }
   
-    // 
-    parseAndProcessPacket();
 
-    // Вычисляем скорость моторов
-    static unsigned long lastTime = 0;
-    unsigned long now = millis();
-    if (now - lastTime >= MEASURE_SPEED_INTERVAL) {      
-      speedLeft = pulseCountLeft;
-      speedRight = pulseCountRight;   
+  
 
-      pulseCountLeft = 0;  // Сбрасываем счетчик
-      pulseCountRight = 0;  // Сбрасываем счетчик    
-      lastTime = now;
-    } 
+  // Установка скорости моторов
+  //motorLeft.setSpeed(1);
+  motorLeft.setSpeed(motorLeftSpeed);
+  //motorRight.setSpeed(motorRightSpeed);
+
+  Serial.printf("%4d %4d %4d\n", motorLeftSpeed, speedLeft, throttle);
 
 
-    //Serial.printf("m1: %4d, imp1: %4d, m2:  %4d, imp2: %4d\n",motorLeftSpeed,speedLeft,motorRightSpeed,speedRight); 
-    //Serial.printf("%4d %4d %4d %4d\n",motorLeftSpeed,speedLeft,motorRightSpeed,speedRight); 
 
-    //Serial.printf("%4d %4d\n",motorLeftSpeed,speedLeft); 
+  //Serial.printf("m1: %4d, imp1: %4d, m2:  %4d, imp2: %4d\n",motorLeftSpeed,speedLeft,motorRightSpeed,speedRight);
+  //Serial.printf("%4d %4d %4d %4d\n",motorLeftSpeed,speedLeft,motorRightSpeed,speedRight);
+  //Serial.printf("%4d %4d\n",motorLeftSpeed,speedLeft);
+  //Serial.printf("ResultSpeed:%4d CurrentSpeed:%4d Throttle:%4d\n",motorLeftSpeed,speedLeft,map(throttle,0,255,0,16));
 
-    motorLeft.setSpeed(motorLeftSpeed);
-    motorRight.setSpeed(motorRightSpeed);
-
-
-    vTaskDelay(1);
+  //delay(10);
+  vTaskDelay(1);
 }
