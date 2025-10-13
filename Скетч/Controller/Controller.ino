@@ -37,7 +37,7 @@ int motorLeftSpeed = 0;
 int motorRightSpeed = 0;
 
 const int dt = 30;
-uPID pid(P_INPUT |D_INPUT| I_SATURATE);
+uPID pid(P_INPUT | D_INPUT | I_SATURATE);
 
 
 /*
@@ -49,12 +49,6 @@ uPID pid(P_INPUT |D_INPUT| I_SATURATE);
 #define SPEED_SENSOR_RIGHT_PIN 34
 
 #define SLOTS_SPEED_DISK 20
-
-long pulseCountLeft = 0;
-long pulseCountRight = 0;
-
-long speedLeft = 0;
-long speedRight = 0;
 
 // Положение дроселя
 int throttle = 0;
@@ -80,13 +74,12 @@ static const uint8_t LIDAR_HEADER[] = { 0x55, 0xAA, 0x03, 0x08 };
 static const uint8_t LIDAR_HEADER_LEN = 4;
 static const uint8_t LIDAR_BODY_LEN = 32;
 
-void IRAM_ATTR pulseISRLeft() {
-  pulseCountLeft++;
-}
+unsigned long lastTimePulseLeft = 0;
 
-void IRAM_ATTR pulseISRRight() {
-  pulseCountRight++;
-}
+xQueueHandle pulseQueueLeft;
+
+
+
 
 // Пороговые расстояния (в миллиметрах) и время залипания аварии
 // ALARM_DIST  — красная зона, WARNING_DIST — жёлтая зона
@@ -541,11 +534,11 @@ bool parseAndProcessPacket() {
   return true;  // Пакет успешно обработан
 }
 
-// Функция для фиксирования значения скорости датчика за определенный промежуток времени и сброса счетчика
-void readSpeedSensor(long& speed, long& pullseCount) {
-  speed = map(constrain(pullseCount, 0, 15), 0, 15, 0, 255);
-  pullseCount = 0;  // Сбрасываем счетчик
-}
+// // Функция для фиксирования значения скорости датчика за определенный промежуток времени и сброса счетчика
+// void readSpeedSensor(long& speed, long& pullseCount) {
+//   speed = map(constrain(pullseCount, 0, 15), 0, 15, 0, 255);
+//   pullseCount = 0;  // Сбрасываем счетчик
+// }
 
 
 // Класс для фильтрации значений с датчиков по скользящему среднему
@@ -566,8 +559,6 @@ private:
   uint8_t _i = 0;
 };
 
-
-AverageWindow<int, 5> speedLeftAver;
 
 class SSF {
 public:
@@ -596,32 +587,86 @@ private:
   float _y1 = 0, _y2 = 0;
 };
 
-SSF speedLeftSSF;
-
-template <typename T>
+template<typename T>
 class Median3 {
-   public:
-    T filter(T val) {
-        if (++_i >= 3) _i = 0;
-        _buf[_i] = val;
-        return getMedian(_buf[0], _buf[1], _buf[2]);
-    }
+public:
+  T filter(T val) {
+    if (++_i >= 3) _i = 0;
+    _buf[_i] = val;
+    return getMedian(_buf[0], _buf[1], _buf[2]);
+  }
 
-    void init(T val) {
-        _buf[0] = _buf[1] = _buf[2] = val;
-    }
+  void init(T val) {
+    _buf[0] = _buf[1] = _buf[2] = val;
+  }
 
-    static inline T getMedian(T a, T b, T c) {
-        return (a < b) ? ((b < c) ? b : ((c < a) ? a : c)) : ((a < c) ? a : ((c < b) ? b : c));
-    }
+  static inline T getMedian(T a, T b, T c) {
+    return (a < b) ? ((b < c) ? b : ((c < a) ? a : c)) : ((a < c) ? a : ((c < b) ? b : c));
+  }
 
-   private:
-    T _buf[3] = {};
-    uint8_t _i = 0;
+private:
+  T _buf[3] = {};
+  uint8_t _i = 0;
 };
 
-Median3<int> medLeftSpeed;
+// Клас для обработки данных с оптического датчика скорости и вычисления RPM вала
+class SpeedSensor {
+public:  
+  void init() {
+    _pulseQueue = xQueueCreate(10, sizeof(unsigned long));  // Очередь на 10 элементов
+    // Инициализация фильтров
+    _speedLeftSSF.config(4, 1 / 0.05);
+    _speedLeftSSF.init(0);
+  }
 
+  // Необходимо вызывать в функции прерывания
+  void pulseISR() {
+    _pulseCount++;
+    unsigned long now = micros();
+    xQueueSendFromISR(_pulseQueue, &now, NULL);  // Отправляем время в очередь
+  }
+
+  float getSpeed() {
+    return _speed;
+  }
+
+  void handlePulse() {
+    // Если прошло много времени с последнего импульса сичтаем что вал не двигается
+    if (micros() - _lastTimePulse > _everyZeroSpeed) {
+      _speed = 0;
+    }
+
+    // Обработка очереди импульсов с датчика
+    unsigned long receivedTime;
+    if (xQueueReceive(_pulseQueue, &receivedTime, 0) == pdTRUE) {
+      // Получили новое время импульса из ISR
+      unsigned long currentDelta = receivedTime - _lastTimePulse;
+      _lastTimePulse = receivedTime;
+      unsigned long filtredDelta = (unsigned long)_speedLeftSSF.filter(_averSpeedLeft.filter(currentDelta));
+      _speed = (float)60000000 / (float(filtredDelta) * _countSectors * 2);
+    }
+  }
+private:
+  QueueHandle_t _pulseQueue;  // Очередь для обработки прерываний датчика скорости
+  long _pulseCount;           // Количество импульсов с
+  unsigned long _lastTimePulse = 0; // Время последнего импульса от датчика
+  unsigned long _everyZeroSpeed = 50000; // Максимальный период не поступления данных от датчика, чтобы считать что скорость = 0
+  int _countSectors = 20; // Количество прорезей в задающем диске
+  float _speed = 0; // Скорость вала RPM
+  SSF _speedLeftSSF; // Сглаживающий ФНЧ фильтр Эхлера
+  AverageWindow<int, 10> _averSpeedLeft; // Скользящее среднее
+};
+
+SpeedSensor leftSpeedSensor;
+SpeedSensor rightSpeedSensor;
+
+void IRAM_ATTR pulseISRLeft() {
+  leftSpeedSensor.pulseISR();
+}
+
+void IRAM_ATTR pulseISRRight() {
+  rightSpeedSensor.pulseISR();
+}
 
 void setup() {
   Serial.begin(BAUDRATE);
@@ -641,16 +686,16 @@ void setup() {
 
   // PID управление моторами
   // Не плохо работающий вариант - 1-0,3-0,1
-  pid.setKp(0.85);
-  pid.setKi(0.05);
-  pid.setKd(0.05);
+  // pid.setKp(0.85);
+  // pid.setKi(0.05);
+  // pid.setKd(0.05);
 
-  // pid.Kbc = 0.1;
-  pid.setDt(dt);
-  pid.outMax = 255;
-  pid.outMin = 0;
+  // // pid.Kbc = 0.1;
+  // pid.setDt(dt);
+  // pid.outMax = 255;
+  // pid.outMin = 0;
 
-  pid.setpoint = 0;
+  // pid.setpoint = 0;
 
   // Setup the Bluepad32 callbacks
   BP32.setup(&onConnectedController, &onDisconnectedController);
@@ -659,19 +704,16 @@ void setup() {
   //BP32.forgetBluetoothKeys();
 
   // Установка плавного изменения скорости для моторов
-  //motorLeft.smoothMode(1);
-  //motorRight.smoothMode(1);
+  motorLeft.smoothMode(1);
+  motorRight.smoothMode(1);
 
   // Установка минимального порога срабатывания моторов
   motorLeft.setMinDuty(77);
   motorRight.setMinDuty(77);
 
-  // Инициализация фильтров
-  speedLeftSSF.config(5, 1 / 0.09);
-  speedLeftSSF.init(0);
-
-
-  medLeftSpeed.init(0);
+  // Очередь для обработки событи от датчиков скорости
+  leftSpeedSensor.init();
+  rightSpeedSensor.init();
 }
 
 void loop() {
@@ -680,39 +722,43 @@ void loop() {
     processControllers();
 
   // Необходимо для плавного режима изменения скорости моторов
-  // motorLeft.tick();
-  // motorRight.tick();
+  motorLeft.tick();
+  motorRight.tick();
+
+  // Обработка очереди данных с датчиков скорости
+  leftSpeedSensor.handlePulse();
+  rightSpeedSensor.handlePulse();
+
+  EVERY_MS(10) {
+    Serial.printf("%.4f %.4f\n", leftSpeedSensor.getSpeed(), rightSpeedSensor.getSpeed());
+  }
 
   // Обработка пакетов от лидара
   // parseAndProcessPacket();
 
-  // Вычисляем скорость моторов
-  EVERY_MS(MEASURE_SPEED_INTERVAL) {
-    readSpeedSensor(speedLeft, pulseCountLeft);
-    speedLeft = medLeftSpeed.filter(speedLeft);
-    readSpeedSensor(speedRight, pulseCountRight);
-  }
 
-  //throttle = 200;
+  //throttle = 10;
 
-  if (throttle!=0){    
-    pid.setpoint = throttle;  
-    motorLeftSpeed = (int)pid.compute(speedLeft);    
-  }else{
-    motorLeftSpeed = 0;
-  }
-  
+  //throttle = map(throttle,0,255,120,300)
 
-  
+  // if (throttle != 0) {
+  //   pid.setpoint = throttle;
+  //   motorLeftSpeed = (int)pid.compute(speedLeft);
+  // } else {
+  //   motorLeftSpeed = 0;
+  // }
+
 
   // Установка скорости моторов
-  //motorLeft.setSpeed(1);
-  motorLeft.setSpeed(motorLeftSpeed);
+  motorLeft.setSpeed(throttle);
+  motorRight.setSpeed(throttle);
+  //motorLeft.setSpeed(motorLeftSpeed);
   //motorRight.setSpeed(motorRightSpeed);
 
-  Serial.printf("%4d %4d %4d\n", motorLeftSpeed, speedLeft, throttle);
+  //Serial.printf("%4d %4d %4d\n", motorLeftSpeed, speedLeft, throttle);
 
-
+  //Serial.println(delta);
+  //Serial.println(pulseCountRight);
 
   //Serial.printf("m1: %4d, imp1: %4d, m2:  %4d, imp2: %4d\n",motorLeftSpeed,speedLeft,motorRightSpeed,speedRight);
   //Serial.printf("%4d %4d %4d %4d\n",motorLeftSpeed,speedLeft,motorRightSpeed,speedRight);
